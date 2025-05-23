@@ -1,0 +1,733 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <ESP32Servo.h>
+#include <Adafruit_NeoPixel.h>
+#include <esp_wifi.h>
+#include <WiFi.h>
+
+// ---------------- I2C Adresi ----------------
+#define MCP23017_ADDRESS 0x20
+
+// ---------------- Mod Tanımları ----------------
+enum EspMode {
+  MODE_IDLE = 0,
+  MODE_LAUNCHER = 1,
+  MODE_GAME = 2,
+  MODE_PAUSE = 3,
+  MODE_MAINTENANCE = 4 ,
+  MODE_LASERCALIB = 5
+
+};
+
+EspMode currentMode = MODE_IDLE;
+
+// ---------------- Pin Tanımları ----------------
+// LASER PINS
+const int laserPins[4] = {15, 4, 16, 17};
+unsigned long previousRGBMillis = 0;
+
+int selectedGun = -1;
+
+bool gunSelectionConfirmed = false;
+bool coinPreviouslyInserted = false;
+
+unsigned long reloadStartTime = 0;
+
+bool isPausedByReload = false;
+bool reloadAnimationInProgress = false;
+
+
+
+const String PARTCHECK = "CHECKPART";
+const String ESPPART = "PART:MAIN_ESP";
+
+
+
+bool laserCalibWaiting = false;
+
+void ServoStatus(int isOpen);  // Bunu handleSerial'dan önce yaz
+void disableAllOutputs();
+void addTickets(int count);
+void startMaintenanceRoutine();  // ← BU SATIRI EKLE
+
+
+
+
+// RGB LED STRIPS
+const int rgbPins[4] = {23, 13, 14, 27};
+#define NUM_LEDS 12
+Adafruit_NeoPixel strips[4] = {
+  Adafruit_NeoPixel(NUM_LEDS, 23, NEO_RBG  + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_LEDS, 13, NEO_RBG  + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_LEDS, 14, NEO_RBG  + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_LEDS, 27, NEO_RBG  + NEO_KHZ800)
+};
+
+// SENSOR PINS
+const int sensorPins[4] = {35, 26, 25, 2};
+
+// MCP23017 A portu: GAZ VALF + AMBIANS
+#define VALF_A0 0
+#define VALF_A1 1
+#define VALF_A2 2
+#define VALF_A3 3
+#define AMBIANCE_A4 4
+
+// MCP23017 B portu: SELECT BUTTONS
+#define SELECT_B0 0
+#define SELECT_B1 1
+#define SELECT_B2 2
+#define SELECT_B3 3
+
+// Ortak parçalar
+const int redemptionPin = 18;
+const int servoPin = 19;
+const int coinPin = 33;
+
+Servo servoMotor;
+
+// ---------------- MCP23017 Başlat ----------------
+void setupMCP23017() {
+  // PORT A: ÇIKIŞ (valf ve ambiyans)
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x00);       // IODIRA
+  Wire.write(0x00);       // A0–A7 = çıkış
+  Wire.endTransmission();
+
+  // PORT B: GİRİŞ (select switch)
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x01);       // IODIRB
+  Wire.write(0x0F);       // B0–B3 = giriş, B4–B7 çıkış
+  Wire.endTransmission();
+
+  // PULL-UP aktif et (B0–B3)
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x0D);       // GPPUB
+  Wire.write(0x0F);       // B0–B3
+  Wire.endTransmission();
+
+  // PORT A: başlangıçta tüm çıkışları pasif yap (HIGH = MOSFET kapalı)
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x14);       // OLATA
+  Wire.write(0xFF);       // hepsi HIGH (pasif)
+  Wire.endTransmission();
+}
+
+// ---------------- MCP23017 A Portu Çıkış Set ----------------
+void setMCP_A_Output(uint8_t pin, bool active) {
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x14); // OLATA
+  Wire.endTransmission(false); // repeated start
+  Wire.requestFrom(MCP23017_ADDRESS, 1);
+  uint8_t current = Wire.read();
+
+  if (active)
+    bitClear(current, pin); // aktif etmek için LOW (MOSFET)
+  else
+    bitSet(current, pin);   // pasif için HIGH
+
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x14); // OLATA
+  Wire.write(current);
+  Wire.endTransmission();
+}
+
+// ---------------- Seri Komut Parser ----------------
+String serialInput = "";
+
+void handleSerial() {
+  while (Serial.available()) {
+    char inChar = Serial.read();
+    serialInput += inChar;
+
+    if (inChar == '\n') {
+      serialInput.trim();
+
+      int colonIndex = serialInput.indexOf(':');
+      if (colonIndex != -1) {
+        String cmd = serialInput.substring(0, colonIndex);
+        String val = serialInput.substring(colonIndex + 1);
+        val.trim();
+
+       if (cmd == "ESP_MODE_SET") {
+    if (val == "IDLE") {
+        currentMode = MODE_IDLE;
+         isPausedByReload = false;
+    reloadAnimationInProgress = false;
+    reloadStartTime = 0;
+
+    }
+    else if (val == "LAUNCHER") {
+        currentMode = MODE_LAUNCHER;
+        gunSelectionConfirmed = false;  // Silah seçimi tekrar yapılabilsin
+         isPausedByReload = false;
+    reloadAnimationInProgress = false;
+    reloadStartTime = 0;
+
+    }
+    else if (val == "GAME") {
+        currentMode = MODE_GAME;
+         isPausedByReload = false;
+    reloadAnimationInProgress = false;
+    reloadStartTime = 0;
+
+    }
+    else if (val == "PAUSE") {
+        currentMode = MODE_PAUSE;
+    }
+    
+    else if (val == "MAINTENANCE") {
+        currentMode = MODE_MAINTENANCE;
+        startMaintenanceRoutine();
+    }
+    else if (val == "LASERCALIB") {
+      currentMode = MODE_LASERCALIB;
+      laserCalibWaiting = true;  // Başlangıçta ilk seçimi bekle
+      disableAllOutputs(); // İlk girişte tüm lazerleri kapat
+  
+}
+
+
+    Serial.println("DEBUG:Mode changed to " + val);
+    
+
+}
+
+        else if (cmd == "SELECTEDGUN") {
+          selectedGun = val.toInt();
+          gunSelectionConfirmed = true;
+          Serial.println("DEBUG:Gun selected = " + String(selectedGun));
+        }
+        else if (cmd == "SERVO") {
+          int servoVal = val.toInt();
+          ServoStatus(servoVal);
+        }
+        else if (cmd == "ADD_REDEMPTION") {
+          int redemptionCount = val.toInt();
+          addTickets(redemptionCount);
+        }
+       else if (cmd == "GUN_PAUSE") {
+  int pauseVal = val.toInt();
+  if (pauseVal == 1) {
+    isPausedByReload = true;
+    reloadAnimationInProgress = false;
+    reloadStartTime = 0;
+  } else {
+    isPausedByReload = false;
+    reloadAnimationInProgress = true;
+    
+  }
+}
+
+        
+        else if (cmd == PARTCHECK) {
+          Serial.println(ESPPART);  // ESP'nin canlı olduğunu bildir
+        }
+        else if (cmd == "RESETGUN") {
+  disableAllOutputs();
+  laserCalibWaiting = true;
+}
+      }
+
+      serialInput = ""; // temizle
+    }
+  }
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  esp_wifi_stop();
+  WiFi.mode(WIFI_OFF);
+
+  delay(500);
+  Serial.println("MAIN_ESP");
+
+  Wire.begin();           // I2C başlat
+  setupMCP23017();        // MCP yapılandır
+  servoMotor.attach(servoPin);
+
+  pinMode(redemptionPin, OUTPUT);
+  pinMode(coinPin, INPUT_PULLUP);
+
+  // Lazer pinlerini çıkış olarak ayarla
+  for (int i = 0; i < 4; i++) {
+    pinMode(laserPins[i], OUTPUT);
+    digitalWrite(laserPins[i], HIGH); // Pasif başlasın
+  }
+
+  // Sensor pinleri
+  for (int i = 0; i < 4; i++) {
+    pinMode(sensorPins[i], INPUT_PULLUP);
+  }
+
+  // RGB LED başlat
+  for (int i = 0; i < 4; i++) {
+    strips[i].begin();
+    strips[i].setBrightness(255);
+    strips[i].show();
+  }
+  disableAllOutputs();
+  setMCP_A_Output(AMBIANCE_A4, true);
+}
+
+// Globale eklemen gerekenler:
+uint8_t policeSirenState = 0;
+float colorPhase = 0.0;
+bool colorIncreasing = true;
+
+void updateRGB() {
+  unsigned long now = millis();
+
+  // 🔴 IDLE MODE — Polis Sireni Efekti (Kırmızı – Mavi – Beyaz dönüşümlü)
+  if (currentMode == MODE_IDLE) {
+    const uint8_t wait = 100;  // Siren hızı
+
+    if (now - previousRGBMillis >= wait) {
+      previousRGBMillis = now;
+
+      uint32_t red    = strips[0].Color(255, 0, 0);     // R
+uint32_t blue   = strips[0].Color(0, 0, 255);     // G → Mavi değil, düzeltildi
+uint32_t white  = strips[0].Color(255, 255, 255); // Beyaz (hepsi açık)
+
+
+      for (int i = 0; i < 4; i++) {
+        Adafruit_NeoPixel &strip = strips[i];
+        for (int j = 0; j < NUM_LEDS; j++) {
+          if (policeSirenState == 0)
+            strip.setPixelColor(j, red);
+          else if (policeSirenState == 1)
+            strip.setPixelColor(j, blue);
+          else if (policeSirenState == 2)
+            strip.setPixelColor(j, white);
+        }
+        strip.show();
+      }
+
+      policeSirenState = (policeSirenState + 1) % 3;
+    }
+  }
+
+  // 🔧 MAINTENANCE MODE — Beyazdan koyu maviye yavaş fade
+  else if (currentMode == MODE_MAINTENANCE) {
+    float step = 0.01f;  // Fade geçiş hızı
+    if (colorIncreasing) {
+      colorPhase += step;
+      if (colorPhase >= 1.0f) {
+        colorPhase = 1.0f;
+        colorIncreasing = false;
+      }
+    } else {
+      colorPhase -= step;
+      if (colorPhase <= 0.0f) {
+        colorPhase = 0.0f;
+        colorIncreasing = true;
+      }
+    }
+
+    // NEO_RBG için R-B-G
+    int r = 255 * (1.0f - colorPhase);
+int g = 0;
+int b = 255;
+
+
+    uint32_t color = strips[0].Color(r, g, b);
+
+    for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < NUM_LEDS; j++) {
+        strips[i].setPixelColor(j, color);
+      }
+      strips[i].show();
+    }
+  }
+
+  // ✅ GAME / LAUNCHER / PAUSE — Seçilen silah yeşil, diğerleri kırmızı
+  else {
+    for (int i = 0; i < 4; i++) {
+      uint32_t color = (i == selectedGun)
+                       ? strips[i].Color(0, 0, 255)   // Yeşil (NEO_RBG → B)
+                       : strips[i].Color(255, 0, 0);  // Kırmızı
+
+      for (int j = 0; j < NUM_LEDS; j++) {
+        strips[i].setPixelColor(j, color);
+      }
+      strips[i].show();
+    }
+  }
+}
+
+
+
+
+
+void readGunSelectButtons() {
+  if (gunSelectionConfirmed) return;
+
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x13);  // GPIOB
+  Wire.endTransmission();
+  Wire.requestFrom(MCP23017_ADDRESS, 1);
+
+  if (Wire.available()) {
+    uint8_t state = Wire.read();
+
+    int b0 = !(state & (1 << 0));
+    int b1 = !(state & (1 << 1));
+    int b2 = !(state & (1 << 2));
+    int b3 = !(state & (1 << 3));
+
+    // Sadece bir tanesi basılıysa sürekli yolla
+    if ((b0 + b1 + b2 + b3) == 1) {
+      if (b0) Serial.println("GUN1SELECT");
+      if (b1) Serial.println("GUN2SELECT");
+      if (b2) Serial.println("GUN3SELECT");
+      if (b3) Serial.println("GUN4SELECT");
+    }
+  }
+}
+
+
+
+
+
+
+
+
+void checkCoin() {
+  bool coinState = digitalRead(coinPin) == LOW; // Aktifse LOW
+
+  if (coinState && !coinPreviouslyInserted) {
+    // Yeni jeton atıldı
+    Serial.println("TOKENACCESS");
+    coinPreviouslyInserted = true;
+  }
+
+  // Boşta HIGH ise tekrar tetiklenmeye izin ver
+  if (!coinState) {
+    coinPreviouslyInserted = false;
+  }
+}
+
+void ServoStatus(int isOpen){
+  if (isOpen == 1)
+    servoMotor.write(94);  // Açık
+  else
+    servoMotor.write(5);   // Kapalı
+}
+
+unsigned long lastShotMillis = 0;
+const unsigned long triggerDebounceDelay = 150; // ms → örneğin 150ms
+
+
+void handleActiveGunSensor() {
+  static bool shotInProgress = false;
+  static unsigned long shotStartTime = 0;
+  static bool prevSensorState = false;
+  static bool triggerDetected = false;
+
+  // Süre tanımları
+  const unsigned long valveDurations[4] = {75, 75, 75, 150};
+  const unsigned long cooldownDurations[4] = {120, 120, 75, 120};
+  const unsigned long reloadAnimationDuration = 300;
+
+  // Mod kontrol
+  if (!gunSelectionConfirmed || selectedGun == -1 || currentMode == MODE_IDLE)
+    return;
+
+  // 🔽 Lazer kontrolü
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(laserPins[i], HIGH); // Hepsini kapat
+  }
+  digitalWrite(laserPins[selectedGun], LOW); // Sadece seçilen silah açık
+
+  int sensorPin = sensorPins[selectedGun];
+  bool sensorActive = digitalRead(sensorPin) == LOW;
+
+  // Tetik düşüşünde bir kereye mahsus SHOTING
+  if (sensorActive && !prevSensorState) {
+  unsigned long now = millis();
+  if (now - lastShotMillis >= triggerDebounceDelay) {
+    Serial.println("SHOTING");
+    triggerDetected = true;
+    lastShotMillis = now;
+  }
+}
+
+  prevSensorState = sensorActive;
+
+  // Reload animasyonu aktifse bekle
+  if (reloadAnimationInProgress) {
+    if (millis() - reloadStartTime < reloadAnimationDuration) return;
+    reloadAnimationInProgress = false;
+  }
+
+ if (isPausedByReload) {
+  triggerDetected = false;
+
+  if (shotInProgress) {
+    unsigned long elapsed = millis() - shotStartTime;
+    
+    if (elapsed >= valveDurations[selectedGun]) {
+      setMCP_A_Output(selectedGun, false);  // Valfi planlanan süresinde kapat
+    }
+    
+    if (elapsed >= valveDurations[selectedGun] + cooldownDurations[selectedGun]) {
+      shotInProgress = false;  // Atış işlemi tamamlandı
+    }
+  }
+
+  return;
+}
+
+
+  // Sadece ilk tetik düşüşünde çalışır
+  if (triggerDetected && !shotInProgress) {
+    setMCP_A_Output(selectedGun, true);  // Valf aç
+    shotStartTime = millis();
+    shotInProgress = true;
+    triggerDetected = false; // tekrar tetiklenmesin
+  }
+
+  if (shotInProgress) {
+    unsigned long elapsed = millis() - shotStartTime;
+    if (elapsed >= valveDurations[selectedGun]) {
+      setMCP_A_Output(selectedGun, false);  // Valf kapa
+    }
+    if (elapsed >= valveDurations[selectedGun] + cooldownDurations[selectedGun]) {
+      shotInProgress = false;
+    }
+  }
+}
+
+
+
+
+void disableAllOutputs() {
+  for (int i = 0; i < 4; i++) {
+    setMCP_A_Output(i, false);          // Valf
+    digitalWrite(laserPins[i], HIGH);   // Lazer kapalı (MOSFET ters)
+  }
+}
+
+void updateAmbianceLight() {
+  if (currentMode == MODE_IDLE) {
+    setMCP_A_Output(AMBIANCE_A4, true);   // Aç (MOSFET tersse LOW yap)
+  } else {
+    setMCP_A_Output(AMBIANCE_A4, false);  // Kapat
+  }
+}
+
+
+unsigned long ticketTime = 0;
+unsigned long previousMillis = 0;
+unsigned long ticketDuration = 83;
+
+void RedemptionController() {
+  unsigned long currentMillis = millis();
+
+  if (ticketTime > 0) {
+    if (currentMillis - previousMillis >= ticketDuration) {
+      previousMillis = currentMillis;
+      ticketTime -= ticketDuration;
+
+      if (ticketTime > 0) {
+        digitalWrite(redemptionPin, LOW);
+      } else {
+        digitalWrite(redemptionPin, HIGH);
+      }
+    }
+  } else {
+    digitalWrite(redemptionPin, HIGH);
+  }
+}
+
+void addTickets(int count) {
+  ticketTime += count * ticketDuration;
+  digitalWrite(redemptionPin, LOW);  // İlk tetik başlat
+}
+
+
+
+void openGasValve(int gunIndex, bool state) {
+  if (gunIndex >= 0 && gunIndex < 4) {
+    setMCP_A_Output(gunIndex, state); // MCP23017 A0–A3 valf çıkışları
+  }
+}
+
+
+// Bakım modunu millis yapmak için
+int maintenanceGunIndex = 0;
+int maintenanceCycleCount = 0;
+unsigned long maintenanceTimer = 0;
+bool maintenanceValveOpen = false;
+bool maintenanceInProgress = false;
+bool postCycleWaitActive = false;
+unsigned long postCycleWaitStart = 0;
+const unsigned long postCycleDelay = 1500; // ← her aç/kapa sonrası ekstra bekleme
+
+const unsigned long maintenanceOpenDurations[4]  = {65, 65, 65, 100}; // ms
+const unsigned long maintenanceCloseDurations[4] = {95, 95, 95, 95}; // ms
+
+
+
+
+void processMaintenance() {
+  if (!maintenanceInProgress) return;
+
+  unsigned long now = millis();
+
+  // Bekleme varsa (aç-kapa sonrası)
+  if (postCycleWaitActive) {
+    if (now - postCycleWaitStart < postCycleDelay) return;
+    postCycleWaitActive = false;
+    maintenanceTimer = now;
+  }
+
+  // 5 döngü bitti mi?
+  if (maintenanceCycleCount >= 5) {
+    maintenanceInProgress = false;
+    Serial.println("DEBUG:Maintenance finished");
+    return;
+  }
+
+  if (!maintenanceValveOpen) {
+    // 🔓 AÇ — tüm valfleri aç
+    for (int i = 0; i < 4; i++) {
+      openGasValve(i, true);
+    }
+    maintenanceValveOpen = true;
+    maintenanceTimer = now;
+    Serial.println("DEBUG:Valves OPEN, cycle " + String(maintenanceCycleCount + 1));
+  }
+
+  // Açıkken süresi dolanları kapat
+  if (maintenanceValveOpen) {
+    for (int i = 0; i < 4; i++) {
+      if (now - maintenanceTimer >= maintenanceOpenDurations[i]) {
+        openGasValve(i, false);
+      }
+    }
+
+    // En uzun açık süresine göre genel kapanma süresi kontrolü
+    unsigned long maxOpenTime = 0;
+    for (int i = 0; i < 4; i++) {
+      if (maintenanceOpenDurations[i] > maxOpenTime)
+        maxOpenTime = maintenanceOpenDurations[i];
+    }
+
+    if (now - maintenanceTimer >= maxOpenTime + maintenanceCloseDurations[0]) { // ortak kapalı süre
+      maintenanceValveOpen = false;
+      maintenanceCycleCount++;
+      postCycleWaitActive = true;
+      postCycleWaitStart = now;
+      Serial.println("DEBUG:Valves CLOSED, wait before next cycle");
+    }
+  }
+}
+
+
+
+
+void startMaintenanceRoutine() {
+  Serial.println("DEBUG:Maintenance started");
+  maintenanceGunIndex = 0;
+  maintenanceCycleCount = 0;
+  maintenanceValveOpen = false;
+  maintenanceTimer = millis();
+  maintenanceInProgress = true;
+}
+
+void laserCalibrationRoutine() {
+  if (!laserCalibWaiting) return;
+
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x13);  // GPIOB
+  Wire.endTransmission();
+  Wire.requestFrom(MCP23017_ADDRESS, 1);
+
+  if (Wire.available()) {
+    uint8_t state = Wire.read();
+
+    int b0 = !(state & (1 << 0));
+    int b1 = !(state & (1 << 1));
+    int b2 = !(state & (1 << 2));
+    int b3 = !(state & (1 << 3));
+
+    if (b0) {
+      disableAllOutputs();
+      digitalWrite(laserPins[0], LOW);
+      laserCalibWaiting = false;
+      Serial.println("CALIB:1");
+    } else if (b1) {
+      disableAllOutputs();
+      digitalWrite(laserPins[1], LOW);
+      laserCalibWaiting = false;
+      Serial.println("CALIB:2");
+    } else if (b2) {
+      disableAllOutputs();
+      digitalWrite(laserPins[2], LOW);
+      laserCalibWaiting = false;
+      Serial.println("CALIB:3");
+    } else if (b3) {
+      disableAllOutputs();
+      digitalWrite(laserPins[3], LOW);
+      laserCalibWaiting = false;
+      Serial.println("CALIB:4");
+    }
+  }
+}
+
+
+
+// ---------------- Loop ----------------
+void loop() {
+  handleSerial();
+  updateRGB();  // RGB efektlerini güncelle
+  checkCoin();  // 🔹 Her modda coin input kontrolü yapılır
+  updateAmbianceLight(); 
+
+
+
+
+  switch (currentMode) {
+    case MODE_IDLE:
+      disableAllOutputs();
+      selectedGun = -1;
+    gunSelectionConfirmed = false;
+    
+      break;
+
+    case MODE_LAUNCHER:
+      // MCP23017 switch okuma buraya yazılabilir
+      readGunSelectButtons();
+  handleActiveGunSensor();  // ← Aktif silah varsa sensör ve valf çalışsın
+  
+      break;
+
+    case MODE_GAME:
+      // sensor + valf + lazer işlemleri buraya
+      handleActiveGunSensor();
+      RedemptionController();
+      
+      break;
+
+    case MODE_PAUSE:
+    disableAllOutputs();
+    RedemptionController();
+      // dondurma modu
+      break;
+    
+    case MODE_MAINTENANCE:
+      processMaintenance();
+      
+      break;
+  
+    case MODE_LASERCALIB:
+
+    laserCalibrationRoutine();
+
+    break;
+}
+
+  delay(10);
+}
