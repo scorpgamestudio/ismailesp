@@ -494,6 +494,26 @@ void handleActiveGunSensor() {
 }
 
 
+/// PAUSE MODDA gaz valfini eklemeyi buraya ekledim sorun olursa buraya müdahale edicem..
+if (currentMode == MODE_PAUSE) {
+  triggerDetected = false;
+
+  if (shotInProgress) {
+    unsigned long elapsed = millis() - shotStartTime;
+
+    if (elapsed >= valveDurations[selectedGun]) {
+      setMCP_A_Output(selectedGun, false);
+    }
+
+    if (elapsed >= valveDurations[selectedGun] + cooldownDurations[selectedGun]) {
+      shotInProgress = false;
+    }
+  }
+
+  return;
+}
+
+
   // Sadece ilk tetik düşüşünde çalışır
   if (triggerDetected && !shotInProgress) {
     setMCP_A_Output(selectedGun, true);  // Valf aç
